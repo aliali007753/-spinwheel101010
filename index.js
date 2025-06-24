@@ -1,117 +1,105 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { MongoClient, ServerApiVersion } = require('mongodb');
-
 const app = express();
-app.use(cors());
+const port = process.env.PORT || 3000;
+
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-const MONGO_URI = process.env.MONGO_URI;
+// الدومينات المسموح لها بالوصول للسيرفر (ضيف دومين الواجهة الأمامية هنا)
+const allowedOrigins = [
+  'https://685aef832ad9f9ade02b7b70--fluffy-genie-0c2826.netlify.app',
+  // إذا عندك دومينات أخرى، أضفها هنا
+];
 
-const BLOCK_TIME = 6 * 60 * 60 * 1000; // 6 ساعات
-const MAX_TRIES = 2;
+// إعدادات CORS مع السماح للكوكيز والطلبات من الدومينات المسموح بها فقط
+const corsOptions = {
+  origin: function (origin, callback) {
+    // السماح للطلبات بدون origin مثل Postman أو بعض المتصفحات
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+};
 
-let db, ipAttempts, codesCollection;
+app.use(cors(corsOptions));
 
-const client = new MongoClient(MONGO_URI, {
-  serverApi: ServerApiVersion.v1
+// متغيرات حالة المستخدم (مثال مؤقت - في الاستخدام الحقيقي لازم قاعدة بيانات)
+let attempts = 2;
+let isBlocked = false;
+let blockStartTime = null;
+const blockDurationHours = 6;
+
+// راجع طلب عدد المحاولات وحالة الحظر
+app.get('/api/attempts', (req, res) => {
+  if (isBlocked) {
+    const now = Date.now();
+    const blockTime = blockDurationHours * 3600 * 1000;
+    const elapsed = now - blockStartTime;
+    if (elapsed >= blockTime) {
+      // انتهى الحظر
+      isBlocked = false;
+      attempts = 2;
+      blockStartTime = null;
+      res.json({ attempts, isBlocked });
+    } else {
+      res.json({ attempts: 0, isBlocked, remainingMs: blockTime - elapsed });
+    }
+  } else {
+    res.json({ attempts, isBlocked });
+  }
 });
 
-async function generateCodes() {
-  const count = await codesCollection.countDocuments();
-  if (count >= 40) return;
-
-  const codes = [];
-  for (let i = 0; i < 40; i++) {
-    const code = Math.random().toString(36).substring(2, 10).toUpperCase();
-    codes.push({ code, used: false, ip: null });
+// تسجيل محاولة دوران
+app.post('/api/spin', (req, res) => {
+  if (isBlocked) {
+    return res.status(403).json({ message: 'تم الحظر، لا يمكن الدوران الآن.' });
   }
-
-  await codesCollection.insertMany(codes);
-  console.log('✅ تم توليد 40 كود عشوائي.');
-}
-
-app.post('/spin', async (req, res) => {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  const record = await ipAttempts.findOne({ ip });
-
-  if (record?.blockExpires && Date.now() < record.blockExpires) {
-    return res.status(429).json({
-      success: false,
-      blocked: true,
-      message: '🚫 تم حظرك مؤقتًا بعد محاولتين. للتواصل معنا لاستلام كود خاص، اضغط الزر أدناه.'
-    });
+  if (attempts <= 0) {
+    isBlocked = true;
+    blockStartTime = Date.now();
+    return res.status(403).json({ message: 'نفذت المحاولات، تم الحظر.' });
   }
-
-  const tries = record?.tries || 0;
-
-  if (tries >= MAX_TRIES) {
-    await ipAttempts.updateOne(
-      { ip },
-      {
-        $set: { blockExpires: Date.now() + BLOCK_TIME },
-        $unset: { tries: "" }
-      },
-      { upsert: true }
-    );
-    return res.status(429).json({
-      success: false,
-      blocked: true,
-      message: '🚫 تجاوزت عدد المحاولات. تم حظرك 6 ساعات.'
-    });
+  attempts--;
+  if (attempts <= 0) {
+    isBlocked = true;
+    blockStartTime = Date.now();
   }
-
-  await ipAttempts.updateOne(
-    { ip },
-    { $inc: { tries: 1 } },
-    { upsert: true }
-  );
-
-  res.json({
-    success: true,
-    message: '🎉 تم تدوير العجلة بنجاح.'
-  });
+  res.json({ attempts, isBlocked });
 });
 
-app.post('/use-code', async (req, res) => {
+// تفعيل كود المحاولات
+const validCodes = new Set([
+  'CODE1', 'CODE2', 'CODE3', 'CODE4', 'CODE5',
+  // أضف أكواد أخرى حسب الحاجة
+]);
+
+let usedCodes = new Set();
+
+app.post('/api/code', (req, res) => {
   const { code } = req.body;
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-
-  const found = await codesCollection.findOne({ code, used: false });
-  if (!found) {
-    return res.status(400).json({
-      success: false,
-      message: '❌ الكود غير صالح أو مستخدم.'
-    });
+  if (!code) {
+    return res.status(400).json({ message: 'يرجى إرسال الكود.' });
   }
-
-  await codesCollection.updateOne({ code }, { $set: { used: true, ip } });
-  await ipAttempts.deleteOne({ ip });
-
-  res.json({
-    success: true,
-    message: '✅ تم تفعيل الكود، بإمكانك استخدام العجلة الآن.'
-  });
+  if (usedCodes.has(code)) {
+    return res.status(400).json({ message: 'الكود مستخدم مسبقاً.' });
+  }
+  if (!validCodes.has(code)) {
+    return res.status(400).json({ message: 'كود غير صالح.' });
+  }
+  // كود صالح ويضاف 3 محاولات
+  attempts += 3;
+  isBlocked = false;
+  blockStartTime = null;
+  usedCodes.add(code);
+  validCodes.delete(code);
+  res.json({ message: 'تمت إضافة 3 محاولات', attempts, isBlocked });
 });
 
-async function start() {
-  try {
-    await client.connect();
-    db = client.db('luckwheel');
-    ipAttempts = db.collection('ip_attempts');
-    codesCollection = db.collection('user_codes');
-
-    await generateCodes();
-
-    app.listen(PORT, () => {
-      console.log(`✅ Server is running on port ${PORT}`);
-    });
-  } catch (err) {
-    console.error('❌ MongoDB Connection Failed:', err);
-    process.exit(1);
-  }
-}
-
-start();
+// بدء السيرفر
+app.listen(port, () => {
+  console.log(`Server listening on port ${port}`);
+});
